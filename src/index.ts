@@ -3,6 +3,7 @@ import { cors } from "@elysiajs/cors";
 import { Server } from "socket.io";
 import { GoogleGenAI } from "@google/genai";
 import { env } from "bun";
+import { Store } from "./store";
 
 // --- 1. الإعدادات والتحقق ---
 
@@ -15,7 +16,7 @@ const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 
 // ⚠️ ملاحظة: الكاش يعمل بشكل أفضل مع موديلات 002 المستقرة أو أحدث النسخ
 // استخدمنا gemini-1.5-pro-002 لدعمه القوي للكاش والسياق الكبير
-const MODEL_NAME = "gemini-3-flash-preview"; // نموذج سريع ويدعم سياق كبير
+const MODEL_NAME = "gemini-1.5-flash-002"; // نموذج سريع ويدعم سياق كبير
 
 // --- 2. تعليمات النظام (System Prompt) ---
 const SYSTEM_INSTRUCTION = `
@@ -46,10 +47,6 @@ const SYSTEM_INSTRUCTION = `
    - اعتمد فقط على الملف المرفق.
 `;
 
-// تخزين سجل المحادثات (UserId -> Messages)
-// ملاحظة: مع الكاش، لا نحتاج لتخزين الملف في السجل، فقط النصوص
-const chatHistory = new Map<string, any[]>();
-
 // --- 3. دوال مساعدة ---
 
 async function waitForFileActive(fileName: string) {
@@ -65,7 +62,60 @@ async function waitForFileActive(fileName: string) {
     }
 }
 
-// --- 4. خادم Elysia (الرفع + إنشاء الكاش) ---
+async function createCacheForBook(fileData: { mimeType: string, localPath: string, originalName: string }) {
+    // 1. Upload to Gemini Files (Temporary)
+    console.log(`📤 Uploading to Gemini: ${fileData.originalName}`);
+
+    // Read file from disk
+    const fileBuffer = await Bun.file(fileData.localPath).arrayBuffer();
+    // Create a Blob-like object or pass the buffer if supported, but Bun.file works well usually
+    // ai.files.upload expects 'file' to be a standard File/Blob or path in node.
+    // Since we are in Bun, let's try passing the file directly from Bun.file() if compatible,
+    // or we might need to cast it.
+    // Note: @google/genai upload usually takes path or File object.
+    // Let's rely on standard File object behavior or read it.
+
+    // We can just construct a File object from the buffer
+    const fileObj = new File([fileBuffer], fileData.originalName, { type: fileData.mimeType });
+
+    const uploadResult: any = await ai.files.upload({
+        file: fileObj,
+        config: { displayName: fileData.originalName, mimeType: fileData.mimeType },
+    });
+
+    await waitForFileActive(uploadResult.name);
+
+    // 2. Create Context Cache
+    console.log("🚀 Creating Context Cache...");
+    const ttlSeconds = 60 * 60; // 1 Hour
+
+    const cacheResult = await ai.caches.create({
+        model: MODEL_NAME,
+        config: {
+            displayName: `Cache_${fileData.originalName}`,
+            systemInstruction: {
+                parts: [{ text: SYSTEM_INSTRUCTION }]
+            },
+            contents: [
+                {
+                    role: "user",
+                    parts: [{
+                        fileData: {
+                            fileUri: uploadResult.uri,
+                            mimeType: uploadResult.mimeType
+                        }
+                    }]
+                }
+            ],
+            ttl: `${ttlSeconds}s`
+        }
+    });
+
+    console.log(`✅ Cache Created: ${cacheResult.name}`);
+    return cacheResult;
+}
+
+// --- 4. خادم Elysia (الرفع + التسجيل) ---
 
 const app = new Elysia()
     .use(cors())
@@ -76,61 +126,28 @@ const app = new Elysia()
             const { file } = body as { file: File };
             if (!file) throw new Error("لم يتم إرسال ملف");
 
-            console.log(`📤 رفع ملف: ${file.name}`);
+            console.log(`📥 Receive File: ${file.name}`);
 
-            // 1. رفع الملف إلى Gemini Files
-            const uploadResult: any = await ai.files.upload({
-                file: file,
-                config: { displayName: file.name, mimeType: file.type.split(';')[0] },
-            });
+            // 1. Save to Local Disk & DB
+            const book = await Store.addBook(file, file.type.split(';')[0]);
 
-            await waitForFileActive(uploadResult.name);
+            // 2. Initial Cache Creation (Optional but good for immediate use)
+            const cacheResult = await createCacheForBook(book);
 
-            // 2. 🔥 إنشاء الكاش (Context Caching)
-            console.log("🚀 جاري إنشاء Cache للكتاب...");
-
-            // مدة بقاء الكاش (مثلاً ساعة واحدة = 3600 ثانية)
-            // ملاحظة: الكاش المدفوع قد يكلف، لكنه يوفر في التوكنات
-            const ttlSeconds = 60 * 60;
-
-            const cacheResult = await ai.caches.create({
-                model: MODEL_NAME,
-                config: {
-                    displayName: `Cache_${file.name}`,
-                    // نضع تعليمات النظام والملف داخل الكاش مرة واحدة وللأبد
-                    systemInstruction: {
-                        parts: [{ text: SYSTEM_INSTRUCTION }]
-                    },
-                    contents: [
-                        {
-                            role: "user",
-                            parts: [{
-                                fileData: {
-                                    fileUri: uploadResult.uri,
-                                    mimeType: uploadResult.mimeType
-                                }
-                            }]
-                        }
-                    ],
-                    ttl: `${ttlSeconds}s`
-                }
-            });
-
-            console.log(`✅ تم إنشاء الكاش: ${cacheResult.name}`);
-            console.log(`🔢 عدد التوكنات: ${cacheResult.usageMetadata?.totalTokenCount || 'غير معروف'}`);
+            // 3. Update DB with Cache Info
+            await Store.updateBookCache(book.id, cacheResult.name, cacheResult.expireTime);
 
             return {
                 success: true,
                 data: {
-                    // نرجع اسم الكاش للعميل ليستخدمه في الشات
+                    bookId: book.id, // Return Book ID instead of Cache Name
                     cacheName: cacheResult.name,
-                    expirationTime: cacheResult.expireTime,
-                    totalTokens: cacheResult.usageMetadata?.totalTokenCount
+                    expirationTime: cacheResult.expireTime
                 }
             };
 
         } catch (error: any) {
-            console.error("Upload/Cache Error:", error);
+            console.error("Upload Error:", error);
             set.status = 500;
             return { success: false, error: error.message };
         }
@@ -141,7 +158,7 @@ const app = new Elysia()
 
 console.log(`🚀 API Server: http://${app.server?.hostname}:${app.server?.port}`);
 
-// --- 5. خادم Socket.IO (المحادثة باستخدام الكاش) ---
+// --- 5. خادم Socket.IO (المحادثة) ---
 
 const io = new Server(3501, { cors: { origin: "*" } });
 console.log("🚀 Socket Server: Port 3501");
@@ -151,44 +168,69 @@ io.on("connection", (socket) => {
 
     socket.on("chat_message", async (data) => {
         try {
-            // العميل يجب أن يرسل cacheName بدلاً من fileUri
-            const { cacheName, message, userId } = data;
+            const { bookId, message, userId } = data;
 
-            if (!cacheName) {
-                socket.emit("chat_response", { success: false, answer: "خطأ: لم يتم توفير مفتاح الكاش (cacheName)." });
+            if (!bookId) {
+                socket.emit("chat_response", { success: false, answer: "خطأ: لم يتم توفير معرف الكتاب (bookId)." });
                 return;
             }
 
-            const historyKey = `${userId}_${cacheName}`;
-            let userHistory = chatHistory.get(historyKey) || [];
+            // 1. Get Book Info
+            const book = Store.getBook(bookId);
+            if (!book) {
+                socket.emit("chat_response", { success: false, answer: "خطأ: الكتاب غير موجود." });
+                return;
+            }
 
-            // نضيف رسالة المستخدم الجديدة للسجل
-            userHistory.push({ role: "user", parts: [{ text: message }] });
+            // 2. Check Cache Status & Re-hydrate if needed
+            let activeCacheName = book.cacheName;
+            let needsRehydration = false;
 
-            // 🔥 استخدام الموديل مع الكاش
-            // const model = ai.getGenerativeModel({ 
-            //     model: MODEL_NAME,
-            //     cachedContent: cacheName // نربط الموديل بالكاش المجهز مسبقاً
-            // });
+            if (!activeCacheName) needsRehydration = true;
+            else if (book.cacheExpireTime) {
+                const now = new Date();
+                const expire = new Date(book.cacheExpireTime);
+                if (now >= expire) {
+                    console.log("⚠️ Cache Expired. Re-hydrating...");
+                    needsRehydration = true;
+                }
+            }
 
-            // إرسال الطلب (نرسل فقط تاريخ المحادثة النصي، الملف والتعليمات موجودة في الكاش)
+            if (needsRehydration) {
+                try {
+                    const newCache = await createCacheForBook(book);
+                    activeCacheName = newCache.name;
+                    await Store.updateBookCache(book.id, newCache.name, newCache.expireTime);
+                } catch (e: any) {
+                    console.error("Failed to re-hydrate cache:", e);
+                    socket.emit("chat_response", { success: false, answer: "خطأ: فشل إعادة تنشيط الكتاب. يرجى المحاولة لاحقاً." });
+                    return;
+                }
+            }
+
+            // 3. Load Chat History
+            let userHistory = Store.getHistory(userId, bookId);
+
+            // 4. Append User Message
+            const userMsg = { role: "user", parts: [{ text: message }] };
+            userHistory.push(userMsg as any);
+
+            // 5. Generate Content
             const response = await ai.models.generateContent({
                 model: MODEL_NAME,
                 contents: userHistory,
                 config: {
-                    cachedContent: cacheName
+                    cachedContent: activeCacheName
                 }
             });
 
             let rawAnswer = response.text || "";
             const formattedAnswer = formatResponseForMarkdown(rawAnswer);
 
-            // تحديث السجل بإجابة الموديل
-            userHistory.push({ role: "model", parts: [{ text: formattedAnswer }] });
-
-            // تقليص الذاكرة (اختياري)
-            if (userHistory.length > 20) userHistory = userHistory.slice(-20);
-            chatHistory.set(historyKey, userHistory);
+            // 6. Append Model Response & Save History
+            const modelMsg = { role: "model", parts: [{ text: formattedAnswer }] };
+            userHistory.push(modelMsg as any);
+            await Store.appendHistory(userId, bookId, [userMsg as any, modelMsg as any]);
 
             socket.emit("chat_response", {
                 success: true,
@@ -198,12 +240,16 @@ io.on("connection", (socket) => {
         } catch (error: any) {
             console.error("❌ Chat Error:", error);
 
-            // معالجة خاصة لانتهاء صلاحية الكاش (404 Not Found)
+            // Check for 404/Not Found specifically if cache was deleted remotely but we thought it was alive
             if (error.message?.includes("Not Found") || error.status === 404) {
-                socket.emit("chat_response", {
+                 socket.emit("chat_response", {
                     success: false,
-                    error: "انتهت جلسة الكتاب (Expired Cache). يرجى إعادة رفع الملف."
+                    answer: "حدث خطأ في الاتصال بالكتاب (ربما انتهت الجلسة). حاول إرسال الرسالة مرة أخرى ليتم التحديث."
+                    // In a real robust system, we would retry immediately here by forcing re-hydration.
+                    // For now, asking user to retry is acceptable or we can add a retry logic.
                 });
+                // Invalidate cache in store so next try forces re-creation
+                // Store.updateBookCache(bookId, "", "");
             } else {
                 socket.emit("chat_response", { success: false, error: "حدث خطأ في المعالجة" });
             }

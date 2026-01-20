@@ -21,14 +21,14 @@ async function uploadFile() {
     return result.data;
 }
 
-function chat(cacheName: string, message: string, userId: string): Promise<any> {
+function chat(bookId: string, message: string, userId: string): Promise<any> {
     return new Promise((resolve, reject) => {
         const socket = io(CHAT_URL);
 
         socket.on("connect", () => {
             console.log(`🔌 Connected to chat server as ${userId}`);
             socket.emit("chat_message", {
-                cacheName,
+                bookId,
                 message,
                 userId
             });
@@ -53,14 +53,19 @@ async function main() {
         // 1. Upload File (REST)
         console.log("📤 Uploading file...");
         const fileData: any = await uploadFile();
-        console.log("✅ File uploaded, Cache Name:", fileData.cacheName);
+        // fileData now contains { bookId, cacheName, expirationTime }
+        console.log(`✅ File uploaded. BookID: ${fileData.bookId}, Cache: ${fileData.cacheName}`);
+
+        if (!fileData.bookId) {
+            throw new Error("❌ Book ID missing from upload response");
+        }
 
         // 2. Chat as User A (Alice)
         console.log("👤 User A: My name is Alice.");
-        await chat(fileData.cacheName, "My name is Alice.", "user_A");
+        await chat(fileData.bookId, "My name is Alice.", "user_A");
 
         console.log("👤 User A: What is my name?");
-        const responseA: any = await chat(fileData.cacheName, "What is my name?", "user_A");
+        const responseA: any = await chat(fileData.bookId, "What is my name?", "user_A");
         console.log("🤖 AI (to User A):", responseA.answer);
 
         if (!responseA.answer.includes("Alice") && !responseA.answer.includes("أليس")) {
@@ -69,15 +74,26 @@ async function main() {
             console.log("✅ Test Passed: AI remembered User A.");
         }
 
-        // 3. Chat as User B (Bob)
+        // 3. Chat as User B (Bob) - Test Isolation
         console.log("👤 User B: What is my name?");
-        const responseB: any = await chat(fileData.cacheName, "What is my name?", "user_B");
+        const responseB: any = await chat(fileData.bookId, "What is my name?", "user_B");
         console.log("🤖 AI (to User B):", responseB.answer);
 
         if (responseB.answer.includes("Alice")) {
             console.error("❌ Test Failed: User B saw User A's context!");
         } else {
             console.log("✅ Test Passed: User B context is isolated.");
+        }
+
+        // 4. Persistence Test (Same User A, new connection)
+        console.log("👤 User A (Reconnect): Do you still know me?");
+        const responseA2: any = await chat(fileData.bookId, "Do you remember my name?", "user_A");
+        console.log("🤖 AI (to User A Reconnect):", responseA2.answer);
+
+        if (!responseA2.answer.includes("Alice") && !responseA2.answer.includes("أليس")) {
+            console.error("❌ Test Failed: History persistence check failed.");
+        } else {
+            console.log("✅ Test Passed: History persisted.");
         }
 
     } catch (error) {
