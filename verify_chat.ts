@@ -21,15 +21,14 @@ async function uploadFile() {
     return result.data;
 }
 
-function chat(fileUri: string, mimeType: string, message: string, userId: string): Promise<any> {
+function chat(cacheName: string, message: string, userId: string): Promise<any> {
     return new Promise((resolve, reject) => {
         const socket = io(CHAT_URL);
 
         socket.on("connect", () => {
             console.log(`🔌 Connected to chat server as ${userId}`);
             socket.emit("chat_message", {
-                fileUri,
-                mimeType,
+                cacheName,
                 message,
                 userId
             });
@@ -54,14 +53,14 @@ async function main() {
         // 1. Upload File (REST)
         console.log("📤 Uploading file...");
         const fileData: any = await uploadFile();
-        console.log("✅ File uploaded:", fileData.name);
+        console.log("✅ File uploaded, Cache Name:", fileData.cacheName);
 
         // 2. Chat as User A (Alice)
         console.log("👤 User A: My name is Alice.");
-        await chat(fileData.fileUri, fileData.mimeType, "My name is Alice.", "user_A");
+        await chat(fileData.cacheName, "My name is Alice.", "user_A");
 
         console.log("👤 User A: What is my name?");
-        const responseA: any = await chat(fileData.fileUri, fileData.mimeType, "What is my name?", "user_A");
+        const responseA: any = await chat(fileData.cacheName, "What is my name?", "user_A");
         console.log("🤖 AI (to User A):", responseA.answer);
 
         if (!responseA.answer.includes("Alice") && !responseA.answer.includes("أليس")) {
@@ -72,7 +71,7 @@ async function main() {
 
         // 3. Chat as User B (Bob)
         console.log("👤 User B: What is my name?");
-        const responseB: any = await chat(fileData.fileUri, fileData.mimeType, "What is my name?", "user_B");
+        const responseB: any = await chat(fileData.cacheName, "What is my name?", "user_B");
         console.log("🤖 AI (to User B):", responseB.answer);
 
         if (responseB.answer.includes("Alice")) {
